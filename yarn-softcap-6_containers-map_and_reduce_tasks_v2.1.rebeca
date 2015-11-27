@@ -1,0 +1,641 @@
+Hadoop SoftCap Timed Rebeca Model
+    Copyright (C) 2015  Helgi Leifsson
+
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+//1. No weights.
+//2. No uber jobs.
+//3. No locality.
+//4. New jobs only started if 2 or more containers available.
+//5. Allocate resources message for map tasks, then for reduce tasks.
+//6. No reduce tasks run before all map tasks finish in a job.
+//7. The am can start reduce tasks by asking for resource allocation
+//once map phase finishes.
+//8. Use the "reserved" feature spotted in the FairScheduler code.
+//9. Assume there is no connection between number of map tasks and the
+//time needed to reduce their output (reduce job length/number of tasks).
+//10. In this case resources equal containers.
+//11. Containers are homogeneous.
+//12. Map tasks complete in 1 unit of time
+//13. Reduce tasks complete in 1 unit of time
+//14. FIFO is the tiebreaker for jobs using the same amount of resources.
+
+//TODO: Once there are CONTAINERS - 1 appmasters running on  the cluster
+//only one task can be run at a time, slowing everything down.
+reactiveclass ResourceManager(10)
+{
+	knownrebecs
+	{
+		Container cc0;
+		Container cc1;
+		Container cc2;
+		Container cc3;
+		Container cc4;
+		Container cc5;
+	}
+	
+	statevars
+	{
+		int EMPTY;
+		int INF;
+		int QUEUE_SIZE;
+		int CONTAINERS;
+		
+		int jobIdCounter;
+
+		int[6] jobIds;
+		int[6] jobIdMapTasks; //NB: The task arrays can be maintained and used for
+		//fault tolerance.
+		int[6] jobIdReduceTasks;
+		int[6] jobIdResourceAllocationRequests;
+		int[6] jobIdAppMasterContainer;
+		
+		int[6] containerStatus; //Contains the jobId using the container,
+		//can be either an AM or a task JVM.
+		
+		int droppedJobs;		
+	}
+	
+	ResourceManager()
+	{
+		EMPTY = -999;
+		INF = 999;
+		
+		QUEUE_SIZE = 6;
+		CONTAINERS = 6;
+		
+		jobIdCounter = 0;
+		
+		jobIds[0] = EMPTY;
+		jobIds[1] = EMPTY;
+		jobIds[2] = EMPTY;
+		jobIds[3] = EMPTY;
+		jobIds[4] = EMPTY;
+		jobIds[5] = EMPTY;
+		jobIdMapTasks[0] = EMPTY;
+		jobIdMapTasks[1] = EMPTY;
+		jobIdMapTasks[2] = EMPTY;
+		jobIdMapTasks[3] = EMPTY;
+		jobIdMapTasks[4] = EMPTY;
+		jobIdMapTasks[5] = EMPTY;
+		jobIdReduceTasks[0] = EMPTY;
+		jobIdReduceTasks[1] = EMPTY;
+		jobIdReduceTasks[2] = EMPTY;
+		jobIdReduceTasks[3] = EMPTY;
+		jobIdReduceTasks[4] = EMPTY;
+		jobIdReduceTasks[5] = EMPTY;
+		jobIdResourceAllocationRequests[0] =  EMPTY;
+		jobIdResourceAllocationRequests[1] =  EMPTY;
+		jobIdResourceAllocationRequests[2] =  EMPTY;
+		jobIdResourceAllocationRequests[3] =  EMPTY;
+		jobIdResourceAllocationRequests[4] =  EMPTY;
+		jobIdResourceAllocationRequests[5] =  EMPTY;
+		jobIdAppMasterContainer[0] = EMPTY;
+		jobIdAppMasterContainer[1] = EMPTY;
+		jobIdAppMasterContainer[2] = EMPTY;
+		jobIdAppMasterContainer[3] = EMPTY;
+		jobIdAppMasterContainer[4] = EMPTY;
+		jobIdAppMasterContainer[5] = EMPTY;
+		
+		containerStatus[0] = EMPTY;
+		containerStatus[1] = EMPTY;
+		containerStatus[2] = EMPTY;
+		containerStatus[3] = EMPTY;
+		containerStatus[4] = EMPTY;
+		containerStatus[5] = EMPTY;
+		
+		droppedJobs = 0;
+		
+		//Tests:
+		//single job:
+		//m 0, r 0 pass
+		//m 1, r 0 pass
+		//m 0, r 1 pass
+		//m 1, r 1 pass
+		//m 3, r 0 pass
+		//m 0, r 3 pass
+		//m 3, r 3 pass
+		//
+		//two jobs:
+		//m 0, r 0 pass
+		//m 1, r 0 pass
+		//m 0, r 1 pass
+		//m 3, r 0 pass
+		//m 0, r 3 pass
+		//m 3, r 3 pass
+		//m 6, r 0 pass
+		//
+		//three jobs:
+		//m 0, r 0 pass
+		//m 3, r 3 pass
+		//
+		//continuous jobs (uniform arrival):
+		//m 0, r 0 pass
+		//m 3, r 3 pass
+		jobIds[0] = jobIdCounter++;
+		jobIdMapTasks[0] = 6;
+		jobIdReduceTasks[0] = 0;
+		jobIdResourceAllocationRequests[0] = 0;
+		jobIdAppMasterContainer[0] = EMPTY;
+
+		jobIds[1] = jobIdCounter++;
+		jobIdMapTasks[1] = 6;
+		jobIdReduceTasks[1] = 0;
+		jobIdResourceAllocationRequests[1] = 0;
+		jobIdAppMasterContainer[1] = EMPTY;
+
+		/*jobIds[2] = jobIdCounter++;
+		jobIdMapTasks[2] = 3;
+		jobIdReduceTasks[2] = 3;
+		jobIdResourceAllocationRequests[2] = 0;
+		jobIdAppMasterContainer[2] = EMPTY;*/
+
+		self.run();
+	}
+	
+	msgsrv run()
+	{
+		//1. Count free containers.
+		//2. Count resources allocated to each job.
+		//3. Distribute the free containers so the resources
+		//used are spread fairly.
+		//4. Insert new jobs into queue.
+		
+		//int[QUEUE_SIZE] jobIdContainersInUse;
+		int[6] jobIdContainersInUse; //Bijective to jobId[]
+		int i = 0;
+		while(i < QUEUE_SIZE)
+		{
+			jobIdContainersInUse[i] = 0;
+			i++;
+		}
+		int freeContainers = 0;
+		i = 0;
+		while(i < CONTAINERS)
+		{
+			if(containerStatus[i] == EMPTY)
+			{
+				freeContainers++;
+			}
+			else //Count the containers in use per job.
+			{
+				int id = containerStatus[i];
+				int j = 0;
+				while(j < QUEUE_SIZE)
+				{
+					if(jobIds[j] == id)
+					{
+						jobIdContainersInUse[j]++;
+					}
+					j++;
+				}
+			}
+			i++;
+		}
+		//Now we have the number of free containers, how many containers
+		//each job requires, and how many each job is using.
+		//Find the job using the least resources, if it is 0,
+		//and there are less than 2 free containers available, ignore the job.
+		//Otherwise, give it a container if it is requesting any.
+		//Do this until there are either no free containers or no jobs
+		//that need resources.
+		//int[CONTAINERS] containerJobIdAllocations;
+		int[6] containerJobIdAllocations;
+		i = 0;
+		while(i < CONTAINERS)
+		{
+			containerJobIdAllocations[i] = EMPTY;
+			i++;
+		}
+		
+		boolean resourceRequestsRemaining = true;
+		while(freeContainers > 0 && resourceRequestsRemaining == true)
+		{
+			int minResourceUsage = INF;
+			int minResourceUsageIndex = EMPTY;
+			int minResourceUsageJobId = INF; //For FIFO
+			i = 0;
+			while(i < QUEUE_SIZE)
+			{
+				if(jobIds[i] != EMPTY)
+				{
+					if(jobIdContainersInUse[i] == 0 && freeContainers >= 2)
+					{
+						//We need a container for both an AM and a
+						//task for jobs that haven't been started.
+						//Otherwise the whole cluster could be occupied by
+						//AMs that aren't processing anything.
+
+						//Find a free container, start an appmaster for this
+						//job, keep the books.
+						boolean break_ = false;
+						int freeContainerId = EMPTY;
+						int j = 0;
+						while(j < CONTAINERS && break_ == false)
+						{
+							if(containerStatus[j] == EMPTY)
+							{
+								freeContainerId = j;
+								break_ = true;
+							}
+							j++;
+						}
+						if(freeContainerId == 0)
+						{
+							cc0.startAppMaster(jobIds[i], jobIdMapTasks[i], jobIdReduceTasks[i]);
+						}
+						else if(freeContainerId == 1)
+						{
+							cc1.startAppMaster(jobIds[i], jobIdMapTasks[i], jobIdReduceTasks[i]);
+						}
+						else if(freeContainerId == 2)
+						{
+							cc2.startAppMaster(jobIds[i], jobIdMapTasks[i], jobIdReduceTasks[i]);
+						}
+						else if(freeContainerId == 3)
+						{
+							cc3.startAppMaster(jobIds[i], jobIdMapTasks[i], jobIdReduceTasks[i]);
+						}
+						else if(freeContainerId == 4)
+						{
+							cc4.startAppMaster(jobIds[i], jobIdMapTasks[i], jobIdReduceTasks[i]);
+						}
+						else if(freeContainerId == 5)
+						{
+							cc5.startAppMaster(jobIds[i], jobIdMapTasks[i], jobIdReduceTasks[i]);
+						}
+						freeContainers -= 1;
+						containerStatus[freeContainerId] = jobIds[i];
+						jobIdAppMasterContainer[i] = freeContainerId;
+						jobIdResourceAllocationRequests[i] = 0;
+						jobIdContainersInUse[i] = 1;
+					}
+					//NB: There's some bug in Rebeca with these conditionals, some of them
+					//don't come out right in the generated C++ code, that's why the
+					//following lines are weird.
+					else if(jobIdContainersInUse[i] == minResourceUsage)
+					{
+						if(jobIdResourceAllocationRequests[i] > 0)
+						{
+							if(jobIds[i] < minResourceUsageJobId)
+							{
+								minResourceUsage = jobIdContainersInUse[i];
+								minResourceUsageIndex = i;
+								minResourceUsageJobId = jobIds[i];
+							}
+						}
+					}
+					else if(jobIdContainersInUse[i] < minResourceUsage)
+					{
+						if(jobIdResourceAllocationRequests[i] > 0)
+						{
+							minResourceUsage = jobIdContainersInUse[i];
+							minResourceUsageIndex = i;
+							minResourceUsageJobId = jobIds[i];						
+						}
+					}
+				}
+				i++;
+			}
+			if(minResourceUsage != INF && minResourceUsageIndex != EMPTY)
+			{
+				//Find a free container to allocate for this job.
+				boolean break_ = false;
+				int freeContainerId = EMPTY;
+				i = 0;
+				while(i < CONTAINERS && break_ == false)
+				{
+					if(containerStatus[i] == EMPTY)
+					{
+						freeContainerId = i;
+						break_ = true;
+					}
+					i++;
+				}
+				containerJobIdAllocations[freeContainerId] = jobIds[minResourceUsageIndex];
+				containerStatus[freeContainerId] = jobIds[minResourceUsageIndex];
+				jobIdResourceAllocationRequests[minResourceUsageIndex] -= 1;
+				jobIdContainersInUse[minResourceUsageIndex]++;
+				freeContainers -= 1;
+			}
+			else //We didn't find a job requesting resources even though there
+			//were free containers and obviously some job(s) using the least resources.
+			{
+				resourceRequestsRemaining = false;
+			}
+		}
+		
+		//Send the messages needed
+		//1. Go through the resource allocation list, if a jobid
+		//is found, find its appmaster and send it the list.
+		//Don't send the same message multiple times.
+		//boolean[QUEUE_SIZE] hasBeenMessaged;
+		boolean[6] hasBeenMessaged;
+		i = 0;
+		while(i < QUEUE_SIZE)
+		{
+			hasBeenMessaged[i] = false;
+			i++;
+		}
+		i = 0;
+		while(i < CONTAINERS)
+		{
+			if(containerJobIdAllocations[i] != EMPTY)
+			{
+				int j = 0;
+				while(j < QUEUE_SIZE)
+				{
+					if(jobIds[j] == containerJobIdAllocations[i] && hasBeenMessaged[j] == false)
+					{
+						if(jobIdAppMasterContainer[j] == 0)
+						{
+							cc0.resources(containerJobIdAllocations[0], containerJobIdAllocations[1], containerJobIdAllocations[2],
+								containerJobIdAllocations[3], containerJobIdAllocations[4], containerJobIdAllocations[5]);
+						}
+						else if(jobIdAppMasterContainer[j] == 1)
+						{
+							cc1.resources(containerJobIdAllocations[0], containerJobIdAllocations[1], containerJobIdAllocations[2],
+								containerJobIdAllocations[3], containerJobIdAllocations[4], containerJobIdAllocations[5]);
+						}
+						else if(jobIdAppMasterContainer[j] == 2)
+						{
+							cc2.resources(containerJobIdAllocations[0], containerJobIdAllocations[1], containerJobIdAllocations[2],
+								containerJobIdAllocations[3], containerJobIdAllocations[4], containerJobIdAllocations[5]);
+						}
+						else if(jobIdAppMasterContainer[j] == 3)
+						{
+							cc3.resources(containerJobIdAllocations[0], containerJobIdAllocations[1], containerJobIdAllocations[2],
+								containerJobIdAllocations[3], containerJobIdAllocations[4], containerJobIdAllocations[5]);
+						}
+						else if(jobIdAppMasterContainer[j] == 4)
+						{
+							cc4.resources(containerJobIdAllocations[0], containerJobIdAllocations[1], containerJobIdAllocations[2],
+								containerJobIdAllocations[3], containerJobIdAllocations[4], containerJobIdAllocations[5]);
+						}
+						else if(jobIdAppMasterContainer[j] == 5)
+						{
+							cc5.resources(containerJobIdAllocations[0], containerJobIdAllocations[1], containerJobIdAllocations[2],
+								containerJobIdAllocations[3], containerJobIdAllocations[4], containerJobIdAllocations[5]);
+						}
+						hasBeenMessaged[j] = true;
+					}
+					j++;
+				}
+			}
+			i++;
+		}
+		
+		//4. insert jobs into queue
+		//tests:
+		//m 0, r 0 pass
+		//m 1, r 1 pass
+		//m 3, r 3 pass
+		/*int newJobs = 1;
+		int mapTasks = 1;
+		int reduceTasks = 1;
+		i = 0;
+		while(i < QUEUE_SIZE && newJobs > 0)
+		{
+			if(jobIds[i] == EMPTY)
+			{
+				jobIds[i] = jobIdCounter++;;
+				jobIdMapTasks[i] = mapTasks;
+				jobIdReduceTasks[i] = reduceTasks;
+				jobIdResourceAllocationRequests[i] = 0;
+				jobIdAppMasterContainer[i] = EMPTY;
+				newJobs -= 1;
+			}
+			i++;
+		}
+		droppedJobs += newJobs;*/
+
+		self.run() after(1);
+	}
+	
+	msgsrv allocateResources(int job_id, int resource_requests)
+	{
+		//Find the index of the job id
+		//Put the number of requests in the corresponding index in the requests
+		//array
+		boolean break_ = false;
+		int i = 0;
+		while(i < QUEUE_SIZE && break_ == false)
+		{
+			if(jobIds[i] == job_id)
+			{
+				jobIdResourceAllocationRequests[i] = resource_requests; //NB: Here we could
+				//have += for things like overlapping map and reduce phases.
+				break_ = true;
+			}
+			i++;
+		}
+	}
+	
+	msgsrv freeContainer(int containerId)
+	{
+		containerStatus[containerId] = EMPTY;
+	}
+	
+	msgsrv jobComplete(int job_id, int containerId)
+	{
+		boolean break_ = false;
+		int i = 0;
+		while(i < QUEUE_SIZE && break_ == false)
+		{
+			if(jobIds[i] == job_id)
+			{
+				jobIds[i] = EMPTY;
+				jobIdMapTasks[i] = EMPTY;
+				jobIdReduceTasks[i] = EMPTY;
+				jobIdResourceAllocationRequests[i] = EMPTY;
+				containerStatus[jobIdAppMasterContainer[i]] = EMPTY;
+				jobIdAppMasterContainer[i] = EMPTY;
+				break_ = true;
+			}
+			i++;
+		}	
+	}
+}
+
+reactiveclass Container(10)
+{
+	knownrebecs
+	{
+		ResourceManager rm;
+		Container cc0;
+		Container cc1;
+		Container cc2;
+		Container cc3;
+		Container cc4;
+		Container cc5;
+	}
+	
+	statevars
+	{
+		int EMPTY;
+		int myId;
+		int jobId;
+		int mapTasks;
+		int reduceTasks;
+	}
+	
+	Container(int id)
+	{
+		EMPTY = -999;
+		myId = id;
+		jobId = EMPTY;
+		mapTasks = EMPTY;
+		reduceTasks = EMPTY;
+	}
+
+	msgsrv startAppMaster(int job_id, int map_tasks, int reduce_tasks)
+	{
+		//1. mappers <= 0 && reducers <= 0
+		//2. mappers > 0 && reducers <= 0
+		//3. mappers <= 0 && reducers > 0
+		//4. mappers > 0 && reducers > 0
+		
+		//1.
+		if(map_tasks <= 0 && reduce_tasks <= 0)
+		{
+			rm.jobComplete(job_id, myId);
+		}
+		else
+		{
+			jobId = job_id;
+			if(map_tasks > 0)
+			{
+				//2. and 4.
+				mapTasks = map_tasks;
+				rm.allocateResources(jobId, mapTasks);
+				//4.
+				if(reduce_tasks > 0)
+				{
+					reduceTasks = reduce_tasks;
+				}
+			}
+			//3. 
+			else if(map_tasks <= 0 && reduce_tasks > 0)
+			{
+				mapTasks = EMPTY;
+				reduceTasks = reduce_tasks;
+				rm.allocateResources(jobId, reduceTasks);
+			}
+		}
+	}
+	
+	msgsrv resources(int cc0status, int cc1status, int cc2status, int cc3status, int cc4status, int cc5status)
+	{
+		if(cc0status == jobId)
+		{
+			cc0.runTask();
+		}
+		if(cc1status == jobId)
+		{
+			cc1.runTask();
+		}
+		if(cc2status == jobId)
+		{
+			cc2.runTask();
+		}
+		if(cc3status == jobId)
+		{
+			cc3.runTask();
+		}
+		if(cc4status == jobId)
+		{
+			cc4.runTask();
+		}
+		if(cc5status == jobId)
+		{
+			cc5.runTask();
+		}
+	}
+	
+	msgsrv runTask()
+	{
+		delay(1);
+		if(sender == cc0)
+		{
+			cc0.taskComplete(myId);
+		}
+		else if(sender == cc1)
+		{
+			cc1.taskComplete(myId);
+		}
+		else if(sender == cc2)
+		{
+			cc2.taskComplete(myId);
+		}
+		else if(sender == cc3)
+		{
+			cc3.taskComplete(myId);
+		}
+		else if(sender == cc4)
+		{
+			cc4.taskComplete(myId);
+		}
+		else if(sender == cc5)
+		{
+			cc5.taskComplete(myId);
+		}
+	}
+	
+	msgsrv taskComplete(int containerId)
+	{
+		rm.freeContainer(containerId);
+		//The am needs to know in what phase it is to know whether the
+		//job is completing, if it needs to wait for more tasks to 
+		//complete, or whether to request resources for reduce tasks.
+		if(mapTasks > 0) //We're in map phase
+		{
+			mapTasks -= 1;
+			if(mapTasks == 0) //Need resources for reduce phase
+			{
+				mapTasks = EMPTY;
+				if(reduceTasks > 0)
+				{
+					rm.allocateResources(jobId, reduceTasks);
+				}
+				else
+				{
+					rm.jobComplete(jobId, myId);
+					jobId = EMPTY;
+					reduceTasks = EMPTY;
+				}
+			}
+		}
+		else if(mapTasks == EMPTY) //In reduce phase
+		{
+			reduceTasks -= 1;
+			if(reduceTasks == 0)
+			{
+				rm.jobComplete(jobId, myId);
+				jobId = EMPTY;
+				reduceTasks = EMPTY;
+			}
+		}
+	}
+}
+
+main
+{
+	ResourceManager rm(cc0, cc1, cc2, cc3, cc4, cc5):();
+	Container cc0(rm, cc0, cc1, cc2, cc3, cc4, cc5):(0);
+	Container cc1(rm, cc0, cc1, cc2, cc3, cc4, cc5):(1);
+	Container cc2(rm, cc0, cc1, cc2, cc3, cc4, cc5):(2);
+	Container cc3(rm, cc0, cc1, cc2, cc3, cc4, cc5):(3);
+	Container cc4(rm, cc0, cc1, cc2, cc3, cc4, cc5):(4);
+	Container cc5(rm, cc0, cc1, cc2, cc3, cc4, cc5):(5);
+}
